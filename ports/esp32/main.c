@@ -37,11 +37,11 @@
 #include "esp_task.h"
 #include "soc/cpu.h"
 #include "esp_log.h"
-#if MICROPY_ESP_IDF_4
-#include "esp32/spiram.h"
-#else
 #include "esp_spiram.h"
-#endif
+#include "esp_timer.h"		// add by zkh
+#include "driver/timer.h"
+
+#include "startup/oled.h"
 
 #include "py/stackctrl.h"
 #include "py/nlr.h"
@@ -67,15 +67,69 @@ int vprintf_null(const char *format, va_list ap) {
     return 0;
 }
 
+volatile uint32_t ticker_ticks_ms = 0;
+extern void mpython_music_tick(void);
+static void timer_1ms_ticker(void *args)
+{
+    ticker_ticks_ms += 1;
+    mpython_music_tick();
+}
+
+void mpython_display_exception(mp_obj_t exc_in)
+{
+    mp_uint_t n, *values;
+    mp_obj_exception_get_traceback(exc_in, &n, &values);
+    if (1) {
+        vstr_t vstr;
+        mp_print_t print;
+        vstr_init_print(&vstr, 50, &print);
+        #if MICROPY_ENABLE_SOURCE_LINE
+        if (n >= 3) {
+            mp_printf(&print, "line %u\n", values[1]);
+        }
+        #endif
+        if (mp_obj_is_native_exception_instance(exc_in)) {
+            mp_obj_exception_t *exc = (mp_obj_exception_t*)MP_OBJ_TO_PTR(exc_in);
+            mp_printf(&print, "%q:\n  ", exc->base.type->name);
+            if (exc->args != NULL && exc->args->len != 0) {
+                mp_obj_print_helper(&print, exc->args->items[0], PRINT_STR);
+            }
+        }
+        oled_init();
+        oled_clear();
+        oled_print(vstr_null_terminated_str(&vstr), 0, 0);
+        oled_show();
+        vstr_clear(&vstr);
+        oled_deinit();
+    }
+}
+
+void mpython_stop_timer(void) {
+    // disable all timer and thread created by main.py
+    for (timer_group_t g = TIMER_GROUP_0; g < TIMER_GROUP_MAX; g++) {
+        for (timer_idx_t i = TIMER_0; i < TIMER_MAX; i++) {
+            timer_pause(g, i);
+        }
+    }
+}
+
+void mpython_stop_thread(void) {
+    #if MICROPY_PY_THREAD
+    mp_thread_deinit();
+    #endif  
+}
+
 void mp_task(void *pvParameter) {
     volatile uint32_t sp = (uint32_t)get_sp();
     #if MICROPY_PY_THREAD
     mp_thread_init(pxTaskGetStackStart(NULL), MP_TASK_STACK_LEN);
     #endif
+    esp_log_level_set("*", ESP_LOG_ERROR);    // only error msg for mpython
+    // esp_log_level_set("*", ESP_LOG_INFO);
+
     uart_init();
 
-    // TODO: CONFIG_SPIRAM_SUPPORT is for 3.3 compatibility, remove after move to 4.0.
-    #if CONFIG_ESP32_SPIRAM_SUPPORT || CONFIG_SPIRAM_SUPPORT
+    #if CONFIG_SPIRAM_SUPPORT
     // Try to use the entire external SPIRAM directly for the heap
     size_t mp_task_heap_size;
     void *mp_task_heap = (void*)0x3f800000;
@@ -100,6 +154,14 @@ void mp_task(void *pvParameter) {
     #endif
 
 soft_reset:
+    // startup
+    oled_init();
+    oled_drawImg(ani_startup[24]);
+    //oled_drawAnimation(ani_startup, 25, 50);
+    //oled_clear();
+    oled_show();
+    oled_deinit();
+
     // initialise the stack pointer for the main thread
     mp_stack_set_top((void *)sp);
     mp_stack_set_limit(MP_TASK_STACK_SIZE - 1024);
@@ -113,6 +175,16 @@ soft_reset:
 
     // initialise peripherals
     machine_pins_init();
+	// add by zhang kaihua
+	// for music function
+	const esp_timer_create_args_t periodic_timer_args = {
+		.callback = &timer_1ms_ticker,
+		.name = "music tick timer"
+	};
+	esp_timer_handle_t periodic_timer;
+    ticker_ticks_ms = 0;
+	ESP_ERROR_CHECK(esp_timer_create(&periodic_timer_args, &periodic_timer));
+	ESP_ERROR_CHECK(esp_timer_start_periodic(periodic_timer, 1000));
 
     // run boot-up scripts
     pyexec_frozen_module("_boot.py");
@@ -143,11 +215,15 @@ soft_reset:
 
     gc_sweep_all();
 
-    mp_hal_stdout_tx_str("MPY: soft reboot\r\n");
+    mp_hal_stdout_tx_str("mpython: soft reboot\r\n");
 
     // deinitialise peripherals
     machine_pins_deinit();
     usocket_events_deinit();
+
+    esp_timer_stop(periodic_timer);
+    esp_timer_delete(periodic_timer);
+    MP_STATE_PORT(music_data) = NULL;
 
     mp_deinit();
     fflush(stdout);
@@ -155,12 +231,8 @@ soft_reset:
 }
 
 void app_main(void) {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
-    xTaskCreatePinnedToCore(mp_task, "mp_task", MP_TASK_STACK_LEN, NULL, MP_TASK_PRIORITY, &mp_main_task_handle, MP_TASK_COREID);
+    nvs_flash_init();
+    xTaskCreate(mp_task, "mp_task", MP_TASK_STACK_LEN, NULL, MP_TASK_PRIORITY, &mp_main_task_handle);
 }
 
 void nlr_jump_fail(void *val) {
@@ -171,14 +243,4 @@ void nlr_jump_fail(void *val) {
 // modussl_mbedtls uses this function but it's not enabled in ESP IDF
 void mbedtls_debug_set_threshold(int threshold) {
     (void)threshold;
-}
-
-void *esp_native_code_commit(void *buf, size_t len) {
-    len = (len + 3) & ~3;
-    uint32_t *p = heap_caps_malloc(len, MALLOC_CAP_EXEC);
-    if (p == NULL) {
-        m_malloc_fail(len);
-    }
-    memcpy(p, buf, len);
-    return p;
 }
